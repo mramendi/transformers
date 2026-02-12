@@ -546,6 +546,37 @@ class GraniteMoeHybridMambaLayer(nn.Module):
 
             # 2-4. Fused kernel for conv1d, SSM, and the final projection
             if self.training and cache_params is None:
+                # Check if out_proj has LoRA adapters (PEFT integration)
+                # AND if mamba-ssm supports LoRA (check function signature)
+                import inspect
+                mamba_supports_lora = 'outproj_lora_A' in inspect.signature(mamba_split_conv1d_scan_combined).parameters
+
+                lora_kwargs = {}
+                if mamba_supports_lora and hasattr(self.out_proj, 'lora_A') and hasattr(self.out_proj, 'lora_B'):
+                    # PEFT LoRA adapters detected AND mamba-ssm supports them
+                    if hasattr(self.out_proj.lora_A, 'default'):
+                        # Get LoRA weights and convert to model dtype (important for bfloat16/float16 models)
+                        model_dtype = self.out_proj.weight.dtype
+                        lora_kwargs['outproj_lora_A'] = self.out_proj.lora_A.default.weight.to(dtype=model_dtype)
+                        lora_kwargs['outproj_lora_B'] = self.out_proj.lora_B.default.weight.to(dtype=model_dtype)
+                        # Calculate scaling: typically alpha / rank
+                        lora_scaling = 1.0
+                        if hasattr(self.out_proj, 'scaling') and hasattr(self.out_proj.scaling, 'default'):
+                            lora_scaling = self.out_proj.scaling['default']
+                        elif hasattr(self.out_proj, 'lora_alpha') and hasattr(self.out_proj, 'r'):
+                            lora_scaling = self.out_proj.lora_alpha['default'] / self.out_proj.r['default']
+                        lora_kwargs['lora_scaling'] = lora_scaling
+                elif hasattr(self.out_proj, 'lora_A') and not mamba_supports_lora:
+                    # LoRA detected but mamba-ssm doesn't support it - warn once
+                    import warnings
+                    warnings.warn(
+                        "LoRA adapters detected on mamba.out_proj, but mamba-ssm doesn't support LoRA integration. "
+                        "Out_proj LoRA adapters will not receive gradients. "
+                        "Install LoRA-enabled mamba-ssm or exclude mamba.out_proj from target_modules.",
+                        UserWarning,
+                        stacklevel=2
+                    )
+
                 out = mamba_split_conv1d_scan_combined(
                     projected_states,
                     self.conv1d.weight.squeeze(1),
@@ -564,6 +595,7 @@ class GraniteMoeHybridMambaLayer(nn.Module):
                     ngroups=self.n_groups,
                     norm_before_gate=False,
                     return_final_states=False,
+                    **lora_kwargs,  # Only passed if mamba-ssm supports it
                     **dt_limit_kwargs,
                 )
 
